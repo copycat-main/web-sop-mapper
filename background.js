@@ -1,30 +1,121 @@
+// ── Offscreen document for downloads ──
+async function ensureOffscreen() {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+  });
+  if (contexts.length === 0) {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['DOM_SCRAPING'],
+      justification: 'Download files with proper filenames via blob URL + anchor click',
+    });
+  }
+}
+
+// ── Context menu ──
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.create({
+    id: 'copycat-save-xpath',
+    title: 'Save XPath',
+    contexts: ['all'],
+  });
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'copycat-save-xpath' && tab?.id) {
+    chrome.tabs.sendMessage(tab.id, { type: 'SAVE_XPATH' });
+  }
+});
+
 // ── State ──
 let recording = false;
 let recordingTabId = null;
 let startTime = null;
 let networkRequests = [];
 let navigations = [];
-let interactions = []; // clicks & inputs from content script
+let interactions = []; // saved xpaths from content script
+let lastGeneratedHar = null;
+let lastGeneratedSteps = null;
+let pendingDownload = null;
 
-// ── Noise filters ──
-const NOISE_PATTERNS = [
-  /google-analytics\.com/,
-  /googletagmanager\.com/,
-  /facebook\.com\/tr/,
-  /doubleclick\.net/,
-  /hotjar\.com/,
-  /sentry\.io/,
-  /cdn\.segment\.com/,
-  /fonts\.googleapis\.com/,
-  /fonts\.gstatic\.com/,
-  /\.woff2?(\?|$)/,
-  /\.ttf(\?|$)/,
-  /favicon\.ico/,
-  /chrome-extension:\/\//,
+// ── Noise filters (synced with CopyCat har_parser + open_browser) ──
+
+// URL substrings — analytics, tracking, CDN, fonts, static assets
+const NOISE_URL_SUBSTRINGS = [
+  // Analytics & tracking
+  'google-analytics.com',
+  'googletagmanager.com',
+  'analytics.google.com',
+  'posthog.com',
+  'sentry.io',
+  'fullstory.com',
+  'hotjar.com',
+  'mixpanel.com',
+  'segment.io',
+  'segment.com',
+  'amplitude.com',
+  'heap.io',
+  'heapanalytics.com',
+  'newrelic.com',
+  'nr-data.net',
+  'doubleclick.net',
+  'facebook.net',
+  'fbevents',
+  'clarity.ms',
+  'datadoghq.com',
+  'logrocket.io',
+  'bugsnag.com',
+  // CDN / static asset hosts
+  'cdn.jsdelivr.net',
+  'unpkg.com',
+  'fonts.googleapis.com',
+  'fonts.gstatic.com',
+  // Chrome internals
+  'chrome-extension://',
 ];
 
+// File extensions that are static assets, not user actions
+const NOISE_EXTENSIONS = [
+  '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp',
+  '.woff', '.woff2', '.ttf', '.eot',
+  '.css', '.js', '.map',
+];
+
+// Headers to strip from HAR output — noise for automation purposes
+const SKIP_HEADERS = new Set([
+  'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+  'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site',
+  'accept-encoding', 'accept-language',
+  'cache-control', 'pragma', 'priority',
+  ':scheme', ':authority', ':method', ':path',
+  'content-encoding', 'content-length',
+  'content-security-policy', 'strict-transport-security',
+  'x-content-type-options', 'x-frame-options', 'x-xss-protection',
+  'vary', 'server', 'date', 'etag', 'last-modified',
+  'age', 'via', 'x-served-by',
+  'x-cache', 'x-cache-hits', 'x-timer',
+  'x-request-id', 'x-runtime',
+  'x-github-request-id', 'x-github-client-version',
+  'x-fetch-nonce', 'x-fetch-nonce-to-validate',
+  'x-requested-with',
+]);
+
 function isNoise(url) {
-  return NOISE_PATTERNS.some((p) => p.test(url));
+  const lower = url.toLowerCase();
+  if (NOISE_URL_SUBSTRINGS.some((s) => lower.includes(s))) return true;
+  // Check file extension (strip query string first)
+  const path = lower.split('?')[0];
+  if (NOISE_EXTENSIONS.some((ext) => path.endsWith(ext))) return true;
+  return false;
+}
+
+function cleanHeaders(headers) {
+  return (headers || []).filter((h) => {
+    const name = h.name.toLowerCase();
+    if (SKIP_HEADERS.has(name)) return false;
+    if (name.startsWith('sec-')) return false;
+    return true;
+  });
 }
 
 // ── Network capture via webRequest ──
@@ -96,8 +187,7 @@ function onTabUpdated(tabId, changeInfo) {
 // ── Build HAR ──
 function buildHAR() {
   const entries = networkRequests.map((req) => {
-    const reqHeaders = [];
-    const resHeaders = req.response?.headers || [];
+    const resHeaders = cleanHeaders(req.response?.headers);
     return {
       startedDateTime: req.startedDateTime,
       time: req.timing.duration || 0,
@@ -106,7 +196,7 @@ function buildHAR() {
         url: req.url,
         httpVersion: 'HTTP/1.1',
         cookies: [],
-        headers: reqHeaders,
+        headers: [],
         queryString: parseQuery(req.url),
         postData: req.requestBody
           ? {
@@ -200,11 +290,12 @@ function buildCopyCatSteps() {
       steps.push({
         step: stepIndex,
         function: 'click_element',
-        display_name: 'Click Element',
+        display_name: evt.data.label || 'Click Element',
         category: 'interaction',
         params: {
           xpath: evt.data.xpath,
         },
+        label: evt.data.label || null,
         meta: {
           tag: evt.data.tag,
           text: evt.data.text,
@@ -218,12 +309,13 @@ function buildCopyCatSteps() {
       steps.push({
         step: stepIndex,
         function: 'input_text',
-        display_name: 'Type Text',
+        display_name: evt.data.label || 'Type Text',
         category: 'interaction',
         params: {
           xpath: evt.data.xpath,
-          text: evt.data.value,
+          text: '',
         },
+        label: evt.data.label || null,
         meta: {
           tag: evt.data.tag,
           inputType: evt.data.inputType,
@@ -237,16 +329,53 @@ function buildCopyCatSteps() {
       steps.push({
         step: stepIndex,
         function: 'select_dropdown_option',
-        display_name: 'Select Dropdown Option',
+        display_name: evt.data.label || 'Select Dropdown Option',
         category: 'interaction',
         params: {
           xpath: evt.data.xpath,
-          option: evt.data.value,
+          option: '',
         },
+        label: evt.data.label || null,
         meta: {
           tag: evt.data.tag,
           id: evt.data.id,
           name: evt.data.name,
+          url: evt.data.url,
+        },
+        timestamp: evt.ts,
+      });
+    } else if (evt.kind === 'extract') {
+      steps.push({
+        step: stepIndex,
+        function: 'extract_content',
+        display_name: evt.data.label || 'Extract Content',
+        category: 'extraction',
+        params: {
+          xpath: evt.data.xpath,
+        },
+        label: evt.data.label || null,
+        meta: {
+          tag: evt.data.tag,
+          text: evt.data.text,
+          id: evt.data.id,
+          url: evt.data.url,
+        },
+        timestamp: evt.ts,
+      });
+    } else if (evt.kind === 'wait') {
+      steps.push({
+        step: stepIndex,
+        function: 'if_element_with_xpath_exists',
+        display_name: evt.data.label || 'Wait For Element',
+        category: 'logic',
+        params: {
+          element_xpath: evt.data.xpath,
+        },
+        label: evt.data.label || null,
+        meta: {
+          tag: evt.data.tag,
+          text: evt.data.text,
+          id: evt.data.id,
           url: evt.data.url,
         },
         timestamp: evt.ts,
@@ -283,9 +412,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       recording,
       xhrCount: networkRequests.length,
       navCount: navigations.length,
-      clickCount: interactions.filter((i) => i.type === 'click').length,
-      inputCount: interactions.filter((i) => i.type === 'input' || i.type === 'select').length,
+      xpathCount: interactions.length,
+      hasData: !!(lastGeneratedHar || lastGeneratedSteps),
     });
+    return true;
+  }
+
+  if (msg.type === 'GET_DATA') {
+    sendResponse({ har: lastGeneratedHar, steps: lastGeneratedSteps });
     return true;
   }
 
@@ -294,6 +428,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     networkRequests = [];
     navigations = [];
     interactions = [];
+    lastGeneratedHar = null;
+    lastGeneratedSteps = null;
     startTime = new Date().toISOString();
     recording = true;
 
@@ -324,11 +460,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     stopListeners();
     chrome.tabs.onUpdated.removeListener(onTabUpdated);
 
-    const har = buildHAR();
-    const steps = buildCopyCatSteps();
+    lastGeneratedHar = buildHAR();
+    lastGeneratedSteps = buildCopyCatSteps();
 
-    sendResponse({ har, steps });
+    sendResponse({ har: lastGeneratedHar, steps: lastGeneratedSteps });
     recordingTabId = null;
+    return true;
+  }
+
+  if (msg.type === 'SAVE_FILE') {
+    ensureOffscreen().then(() => {
+      chrome.runtime.sendMessage({
+        type: 'OFFSCREEN_DOWNLOAD',
+        json: msg.json,
+        filename: msg.filename,
+      });
+    });
     return true;
   }
 
