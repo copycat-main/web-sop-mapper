@@ -8,7 +8,9 @@
     "webRequest",
     "tabs",
     "downloads",
-    "scripting"
+    "scripting",
+    "contextMenus",
+    "offscreen"
   ],
   "host_permissions": ["<all_urls>"],
   "action": {
