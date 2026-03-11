@@ -11,7 +11,7 @@
 ---
 
 <p align="center">
-  <video src="demo.mov" autoplay loop muted playsinline width="600"></video>
+  <img src="demo.gif" alt="Demo" width="600" />
 </p>
 
 ---
